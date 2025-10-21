@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
-from typing import List, Tuple, Optional, Union, Dict, Optional, Any
+from typing import List, Tuple, Optional, Union, Dict, Any
 import inspect
 import argparse
 import math
@@ -20,10 +20,11 @@ import torch.utils.checkpoint
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.utils import clip_grad_norm_
 
-from transformers import CLIPTextModel, CLIPTokenizer
+from datasets import load_dataset
+from transformers import GemmaTokenizerFast, Gemma2Model
 
 from diffusers import (
-    AutoencoderKL, DDPMScheduler, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+    SanaPipeline, SanaTransformer2DModel, AutoencoderDC, DPMSolverMultistepScheduler
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import is_wandb_available
@@ -44,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     
     parser = argparse.ArgumentParser(description="Train a stable diffusion model.", prog="Train ESD")
 
-    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True, 
-        help="Path to pretrained model or model identifier from huggingface.co/models.")
+    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True,  default="Efficient-Large-Model/SANA_Sprint_0.6B_1024px_teacher_diffusers",
+        help="Path to pretrained sana model or model identifier from huggingface.co/models.")
     parser.add_argument("--revision", type=str, default=None, required=False, 
         help="Revision of pretrained model identifier from huggingface.co/models.")
     parser.add_argument("--variant", type=str, default=None, required=False,
@@ -59,9 +60,9 @@ def parse_args() -> argparse.Namespace:
               "If len == 1 and ends with `.txt` (seperated by newline), read from file."))
     parser.add_argument("--num_images_per_prompt", type=int, default=1,)
     
-    parser.add_argument("--guidance_scale", type=float, default=3.0,
+    parser.add_argument("--guidance_scale", type=float, default=4.5,
         help="The scale of the CFG guidance for z_t.")
-    parser.add_argument("--concept_scale", type=float, default=3.0,
+    parser.add_argument("--concept_scale", type=float, default=4.5,
         help="The scale of the safety (negative) guidance for the target.")
     parser.add_argument("--finetuning_method", type=str, default="xattn",
         choices=["full", "selfattn", "xattn", "noxattn", "notime"])
@@ -96,17 +97,17 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument("--seed", type=int, default=None, required=False,
         help="A seed for reproducible training.")
-    parser.add_argument("--resolution", type=int, default=512,
+    parser.add_argument("--resolution", type=int, default=1024,
         help="The resolution for input images.")
     parser.add_argument("--train_batch_size", type=int, default=1,
         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--num_train_steps", type=int, default=1000,
         help="The total number of training iterations to perform.")
-    parser.add_argument("--num_ddpm_steps", type=int, default=1000,
-        help="The total number of DDPM steps for training.")
-    parser.add_argument("--num_ddim_steps", type=int, default=50,
-        help="The total number of DDIM steps for inference.")
-    parser.add_argument("--num_inference_steps", type=int, default=25,
+    # parser.add_argument("--num_ddpm_steps", type=int, default=1000,
+    #     help="The total number of DDPM steps for training.")
+    # parser.add_argument("--num_ddim_steps", type=int, default=50,
+    #     help="The total number of DDIM steps for inference.")
+    parser.add_argument("--num_inference_steps", type=int, default=20,
         help="The total number of sampling steps for inference.")
     parser.add_argument("--eta", type=float, default=0.0, 
         help="The eta value for DDIM. eta 0.0 corresponds to DDIM, and 1.0 to DDPM.")
@@ -139,7 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", type=int, nargs="+", default=[0, 0])
     
     parser.add_argument("--use_wandb", action="store_true",)
-    parser.add_argument("--wandb_project", type=str, default="safe-diffusion")
+    parser.add_argument("--wandb_project", type=str, default="meta_unlearning")
 
     parser.add_argument(
         "--random_flip",
@@ -170,10 +171,10 @@ def set_seed(seed: int):
 
 def validate(
     args: argparse.Namespace,
-    vae: AutoencoderKL,
-    text_encoder: CLIPTextModel,
-    tokenizer: CLIPTokenizer,
-    unet: torch.nn.Module,
+    vae: AutoencoderDC,
+    text_encoder: Gemma2Model,
+    tokenizer: GemmaTokenizerFast,
+    transformer: SanaTransformer2DModel,
     weight_dtype: torch.dtype,
     step: int,
     device: torch.device,
@@ -181,17 +182,25 @@ def validate(
 ):
     logger.info("Running validation...")
 
-    pipeline = StableDiffusionPipeline.from_pretrained(
+    pipeline = SanaPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
-        unet=unet,
-        safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
+        transformer=transformer,
         torch_dtype=weight_dtype,
     )
+    # pipeline = StableDiffusionPipeline.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     vae=vae,
+    #     text_encoder=text_encoder,
+    #     tokenizer=tokenizer,
+    #     unet=unet,
+    #     safety_checker=None,
+    #     revision=args.revision,
+    #     variant=args.variant,
+    #     torch_dtype=weight_dtype,
+    # )
     pipeline = pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
 
@@ -266,49 +275,49 @@ def validate(
         torch.cuda.empty_cache()
 
 
-def gather_parameters(args: argparse.Namespace, unet: UNet2DConditionModel) -> Tuple[List[str], List[torch.nn.Parameter]]:
+def gather_parameters(args: argparse.Namespace, transformer: SanaTransformer2DModel) -> Tuple[List[str], List[torch.nn.Parameter]]:
     """Gather the parameters to be optimized by the optimizer."""
     names, parameters = [], []
-    for name, param in unet.named_parameters():
+    for name, param in transformer.named_parameters():
         if args.finetuning_method == "full":
             # Train all layers.
             names.append(name)
             parameters.append(param)
-        elif args.finetuning_method == "selfattn":
-            # Attention layer 1 is the self-attention layer.
-            if "attn1" in name:
-                names.append(name)
-                parameters.append(param)
-        elif args.finetuning_method == "xattn":
-            # Attention layer 2 is the cross-attention layer.
-            if "attn2" in name:
-                names.append(name)
-                parameters.append(param)
-        elif args.finetuning_method == "noxattn":
-            # Train all layers except the cross attention and time_embedding layers.
-            if name.startswith("conv_out.") or ("time_embed" in name):
-                # Skip the time_embedding layer.
-                continue
-            elif "attn2" in name:
-                # Skip the cross attention layer.
-                continue
-            names.append(name)
-            parameters.append(param)
-        elif args.finetuning_method == "notime":
-            # Train all layers except the time_embedding layer.
-            if name.startswith("conv_out.") or ("time_embed" in name):
-                continue
-            names.append(name)
-            parameters.append(param)
+        # elif args.finetuning_method == "selfattn":
+        #     # Attention layer 1 is the self-attention layer.
+        #     if "attn1" in name:
+        #         names.append(name)
+        #         parameters.append(param)
+        # elif args.finetuning_method == "xattn":
+        #     # Attention layer 2 is the cross-attention layer.
+        #     if "attn2" in name:
+        #         names.append(name)
+        #         parameters.append(param)
+        # elif args.finetuning_method == "noxattn":
+        #     # Train all layers except the cross attention and time_embedding layers.
+        #     if name.startswith("conv_out.") or ("time_embed" in name):
+        #         # Skip the time_embedding layer.
+        #         continue
+        #     elif "attn2" in name:
+        #         # Skip the cross attention layer.
+        #         continue
+        #     names.append(name)
+        #     parameters.append(param)
+        # elif args.finetuning_method == "notime":
+        #     # Train all layers except the time_embedding layer.
+        #     if name.startswith("conv_out.") or ("time_embed" in name):
+        #         continue
+        #     names.append(name)
+        #     parameters.append(param)
         else:
             raise ValueError(f"Unknown finetuning method: {args.finetuning_method}")
 
     return names, parameters
 
-def gather_parameters_full(args: argparse.Namespace, unet: UNet2DConditionModel) -> Tuple[List[str], List[torch.nn.Parameter]]:
+def gather_parameters_full(args: argparse.Namespace, transformer: SanaTransformer2DModel) -> Tuple[List[str], List[torch.nn.Parameter]]:
     """Gather the parameters to be optimized by the optimizer."""
     names, parameters = [], []
-    for name, param in unet.named_parameters():
+    for name, param in transformer.named_parameters():
         # Train all layers.
         names.append(name)
         parameters.append(param)        
@@ -316,9 +325,9 @@ def gather_parameters_full(args: argparse.Namespace, unet: UNet2DConditionModel)
 
 def save_checkpoint(
     args: argparse.Namespace,
-    text_encoder: CLIPTextModel,
-    vae: AutoencoderKL,
-    unet: UNet2DConditionModel,
+    text_encoder: Gemma2Model,
+    vae: AutoencoderDC,
+    transformer: SanaTransformer2DModel,
     step: Optional[int]=None,
 ):
     """Save a checkpoint. If step is None, save the entire pipeline.
@@ -336,15 +345,14 @@ def save_checkpoint(
                 shutil.rmtree(checkpoints[0])
                 print(f"Removed checkpoint {checkpoints[0]}")
         os.makedirs(output_dir, exist_ok=True)
-        unet.save_pretrained(output_dir)
+        transformer.save_pretrained(output_dir)
     else:
         output_dir = args.output_dir
-        pipeline = StableDiffusionPipeline.from_pretrained(
+        pipeline = SanaPipeline.from_pretrained(
             pretrained_model_name_or_path=args.pretrained_model_name_or_path,
             text_encoder=text_encoder,
             vae=vae,
-            unet=unet,
-            revision=args.revision,
+            transformer=transformer,
         )
         pipeline.save_pretrained(output_dir)
 
@@ -355,8 +363,8 @@ def encode_prompt(
     negative_prompt: Union[str, List[str]]=None,
     removing_prompt: Union[str, List[str]]=None,
     num_images_per_prompt: int=1,
-    text_encoder: CLIPTextModel=None,
-    tokenizer: CLIPTokenizer=None,
+    text_encoder: Gemma2Model=None,
+    tokenizer: GemmaTokenizerFast=None,
     device: torch.device=None,
 ):
     """Encode a prompt into a text embedding. Prompt can be None."""
@@ -374,14 +382,16 @@ def encode_prompt(
 
     batch_size = len(prompt) if prompt is not None else 1
 
-    use_attention_mask = hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask
+    # use_attention_mask = True #hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask # False
     device = device if device is not None else text_encoder.device
+
+    tokenizer.padding_side = "right"
 
     # Tokenization
     uncond_input = tokenizer(
         [""] * batch_size if negative_prompt is None else negative_prompt,
         padding="max_length", 
-        max_length=tokenizer.model_max_length,
+        max_length=min(tokenizer.model_max_length, 300),
         truncation=True,
         return_tensors="pt",
     )
@@ -390,7 +400,7 @@ def encode_prompt(
         prompt_input = tokenizer(
             prompt,
             padding="max_length",
-            max_length=tokenizer.model_max_length, 
+            max_length=min(tokenizer.model_max_length, 300),
             truncation=True,
             return_tensors="pt",
         )
@@ -401,7 +411,7 @@ def encode_prompt(
         removing_input = tokenizer(
             removing_prompt,
             padding="max_length",
-            max_length=tokenizer.model_max_length, 
+            max_length=min(tokenizer.model_max_length, 300),
             truncation=True,
             return_tensors="pt",
         )
@@ -409,22 +419,27 @@ def encode_prompt(
         removing_input = None
 
     # Encoding
+    attn_mask = uncond_input["attention_mask"].to(device)
     prompt_embeds = text_encoder(
         input_ids=uncond_input["input_ids"].to(device),
-        attention_mask=uncond_input["attention_mask"].to(device) if use_attention_mask else None,
+        attention_mask=attn_mask,
     )[0]
     if prompt_input is not None:
+        prompt_attn_mask = prompt_input["attention_mask"].to(device)
         prompt_emb = text_encoder(
             input_ids=prompt_input["input_ids"].to(device),
-            attention_mask=prompt_input["attention_mask"].to(device) if use_attention_mask else None,
+            attention_mask=prompt_attn_mask,
         )[0]
+        attn_mask = torch.cat([attn_mask, prompt_attn_mask], dim=0)
         prompt_embeds = torch.cat([prompt_embeds, prompt_emb], dim=0)
     
     if removing_input is not None:
+        removing_attn_mask = removing_input["attention_mask"].to(device)
         removing_emb = text_encoder(
             input_ids=removing_input["input_ids"].to(device),
-            attention_mask=removing_input["attention_mask"].to(device) if use_attention_mask else None,
+            attention_mask=removing_attn_mask,
         )[0]
+        attn_mask = torch.cat([attn_mask, removing_attn_mask], dim=0)
         prompt_embeds = torch.cat([prompt_embeds, removing_emb], dim=0)
 
     # Duplicate the embeddings for each image.
@@ -432,8 +447,13 @@ def encode_prompt(
         seq_len = prompt_embeds.shape[1]
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.reshape(batch_size * num_images_per_prompt, seq_len, -1)
+
+    max_len = min(tokenizer.model_max_length, 300)
+    select_index = [0] + list(range(-max_len + 1, 0))
+    prompt_embeds = prompt_embeds[:, select_index]
+    attn_mask = attn_mask[:, select_index]
     
-    return prompt_embeds
+    return prompt_embeds, attn_mask
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
@@ -461,15 +481,20 @@ def prepare_extra_step_kwargs(scheduler, generator, eta):
 def sample_until(
     until: int,
     latents: torch.Tensor,
-    unet: UNet2DConditionModel,
-    scheduler: DDIMScheduler,
+    transformer: SanaTransformer2DModel,
+    scheduler: DPMSolverMultistepScheduler,
     prompt_embeds: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
     guidance_scale: float,
+    num_inference_steps: int,
     extra_step_kwargs: Optional[Dict[str, Any]]=None,
 ):
     """Sample latents until t for a given prompt."""
-    timesteps = scheduler.timesteps
 
+    # Prepare timesteps
+    scheduler.set_timesteps(num_inference_steps, device=latents.device)
+    timesteps = scheduler.timesteps
+    
     do_guidance = abs(guidance_scale) > 1.0
 
     # Denoising loop
@@ -479,10 +504,21 @@ def sample_until(
             if do_guidance
             else latents
         )
-        latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+        # latent_model_input = scheduler.scale_model_input(latent_model_input, t) # no-op in sana
+        latent_model_input = latent_model_input.to(prompt_embeds.dtype)
 
-        # predict the noise residual
-        noise_pred = unet(latent_model_input, t, encoder_hidden_states=prompt_embeds).sample
+        timestep = t * transformer.config.timestep_scale
+        timestep = timestep.expand(latent_model_input.shape[0]).to(latents.dtype)
+
+        # predict the de-noise vector field
+        # print(t)
+        noise_pred = transformer(
+            latent_model_input, 
+            timestep=timestep,
+            encoder_hidden_states=prompt_embeds,
+            encoder_attention_mask=prompt_attention_mask,
+        )[0]
+        noise_pred = noise_pred.float()
 
         # perform guidance
         if do_guidance:
@@ -493,7 +529,7 @@ def sample_until(
             # add the guidance term to the noise residual
             noise_pred = noise_pred_uncond + (guidance_scale * cond_guidance)
 
-        latents = scheduler.step(model_output=noise_pred, timestep=t, sample=latents, **extra_step_kwargs).prev_sample
+        latents = scheduler.step(model_output=noise_pred, timestep=t, sample=latents, **extra_step_kwargs)[0]
 
         if i == (until-1):
             # print(f"Sampled until t={t}, i={i}.")
@@ -508,20 +544,19 @@ def train_unlearn_step(
     prompt: str,
     removing_prompt: str,
     generator: torch.Generator,
-    noise_scheduler: DDPMScheduler,
-    ddim_scheduler: DDIMScheduler,
-    text_encoder: CLIPTextModel,
-    tokenizer: CLIPTokenizer,
-    unet_teacher: UNet2DConditionModel,
-    unet_student: UNet2DConditionModel,
+    noise_scheduler: DPMSolverMultistepScheduler,
+    text_encoder: Gemma2Model,
+    tokenizer: GemmaTokenizerFast,
+    transformer_teacher: SanaTransformer2DModel,
+    transformer_student: SanaTransformer2DModel,
     devices: List[torch.device],
 ) -> torch.Tensor:
     """Train the model a single step for a given prompt and return the loss."""
 
-    unet_student.train()
+    transformer_student.train()
 
     # Encode prompt
-    prompt_embeds = encode_prompt(
+    prompt_embeds, prompt_attention_mask = encode_prompt(
         prompt=prompt, 
         removing_prompt=removing_prompt,
         text_encoder=text_encoder, 
@@ -530,46 +565,50 @@ def train_unlearn_step(
     )
     
     uncond_emb, cond_emb, safety_emb = torch.chunk(prompt_embeds, 3, dim=0)
+    uncond_attn_mask, cond_attn_mask, safety_attn_mask = torch.chunk(prompt_attention_mask, 3, dim=0)
     batch_size = cond_emb.shape[0]
 
     # Prepare timesteps
-    noise_scheduler.set_timesteps(args.num_ddpm_steps, devices[1])
+    noise_scheduler.set_timesteps(args.num_inference_steps, devices[1])
 
     # Prepare latent codes to generate z_t
-    latent_shape = (batch_size, unet_teacher.config.in_channels, 64, 64)
+    latent_shape = (batch_size, transformer_teacher.config.in_channels, 32, 32) # 32 because of the DC VAE in sana, for 1024p images
     latents = torch.randn(latent_shape, generator=generator, device=devices[0])
-    # Scale the initial noise by the standard deviation required by the scheduler
-    latents = latents * ddim_scheduler.init_noise_sigma # z_T
+    # Scale the initial noise by the standard deviation required by the scheduler - not needed in sana
+    # latents = latents * ddim_scheduler.init_noise_sigma # z_T
 
-    # Normally, DDPM takes 1,000 timesteps for training, and DDIM takes 50 timesteps for inference.
-    t_ddim = torch.randint(0, args.num_ddim_steps, (1,))
-    t_ddpm_start = round((1 - (int(t_ddim) + 1) / args.num_ddim_steps) * args.num_ddpm_steps)
-    t_ddpm_end   = round((1 - int(t_ddim)       / args.num_ddim_steps) * args.num_ddpm_steps)
-    t_ddpm = torch.randint(t_ddpm_start, t_ddpm_end, (batch_size,),)
-    # print(f"t_ddim: {t_ddim}, t_ddpm: {t_ddpm}")
+    t = torch.randint(0, args.num_inference_steps, (1,)) # In total we usually have ~20 steps in FM models
     # Prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
     extra_step_kwargs = prepare_extra_step_kwargs(noise_scheduler, generator, args.eta)
+
+    timestep = noise_scheduler.timesteps[t]
+    timestep = timestep * transformer_teacher.config.timestep_scale
+    timestep = timestep.expand(latents.shape[0]).to(latents.dtype)
 
     with torch.no_grad():
         # args.guidance_scale: s_g in the paper
         prompt_embeds = torch.cat([uncond_emb, cond_emb], dim=0) if args.guidance_scale > 1.0 else uncond_emb
-        prompt_embeds = prompt_embeds.to(unet_student.device)
+        prompt_embeds = prompt_embeds.to(transformer_student.device)
+        prompt_attention_mask = torch.cat([uncond_attn_mask, cond_attn_mask], dim=0) if args.guidance_scale > 1.0 else uncond_attn_mask
+        prompt_attention_mask = prompt_attention_mask.to(transformer_student.device)
 
         # Generate latents
         latents = sample_until(
-            until=int(t_ddim),
+            until=int(t)+1,
             latents=latents,
-            unet=unet_student,
-            scheduler=ddim_scheduler,
+            transformer=transformer_student,
+            scheduler=noise_scheduler,
             prompt_embeds=prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
             guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
             extra_step_kwargs=extra_step_kwargs,
         )
 
         # Stop-grad and send to the second device
         _latents = latents.to(devices[1])
-        e_0 = unet_teacher(_latents, t_ddpm.to(devices[1]), encoder_hidden_states=uncond_emb).sample
-        e_p = unet_teacher(_latents, t_ddpm.to(devices[1]), encoder_hidden_states=safety_emb).sample
+        e_0 = transformer_teacher(_latents, timestep=timestep.to(devices[1]), encoder_hidden_states=uncond_emb, encoder_attention_mask=uncond_attn_mask).sample
+        e_p = transformer_teacher(_latents, timestep=timestep.to(devices[1]), encoder_hidden_states=safety_emb, encoder_attention_mask=safety_attn_mask).sample
 
         e_0 = e_0.detach().to(devices[0])
         e_p = e_p.detach().to(devices[0])
@@ -577,96 +616,87 @@ def train_unlearn_step(
         # args.concept_scale: s_s in the paper
         noise_target = e_0 - args.concept_scale * (e_p - e_0)
 
-    noise_pred = unet_student(latents, t_ddpm.to(devices[0]), encoder_hidden_states=safety_emb.to(devices[0])).sample
+    noise_pred = transformer_student(
+        latents, 
+        timestep=timestep.to(devices[0]), 
+        encoder_hidden_states=safety_emb.to(devices[0]), 
+        encoder_attention_mask=safety_attn_mask.to(devices[0])
+    ).sample
 
     loss = F.mse_loss(noise_pred, noise_target)
     
     return loss
 
-def train_step(dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,fixed_time_step=1,train_set=False):
+def train_step(
+    dataloader,
+    task_transformer: SanaTransformer2DModel,
+    task_optimizer: optim.AdamW,
+    task_lr_scheduler: LambdaLR,
+    vae: AutoencoderDC,
+    text_encoder: Gemma2Model,
+    noise_scheduler: DPMSolverMultistepScheduler,
+    args,
+    fixed_time_step=1,
+    train_set=False
+):
     all_losses = []
     for step, batch in enumerate(dataloader):
-            latents = vae.encode(batch["pixel_values"].to(vae.device)).latent_dist.sample()
+            latents = vae.encode(batch["pixel_values"].to(task_transformer.device))['latent']
             latents = latents * vae.config.scaling_factor
 
+            bsz = latents.shape[0]
             noise = torch.randn_like(latents)
 
-            bsz = latents.shape[0]
-            if args.fix_timesteps and not train_set:
-                timesteps = torch.ones(bsz, dtype=torch.long, device=latents.device) * fixed_time_step
-            else:
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
-            
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            # Prepare timesteps
+            noise_scheduler.set_timesteps(args.num_inference_steps, device=task_transformer.device)
 
-            encoder_hidden_states = text_encoder(batch["input_ids"].to(vae.device), return_dict=False)[0]
+            idx = torch.randint(0, noise_scheduler.timesteps.shape[0], (bsz,), device=latents.device)
+            sched_t = noise_scheduler.timesteps.to(latents.device)[idx]
+            scaled_timesteps = sched_t * task_transformer.config.timestep_scale
 
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
+
+            # timesteps = torch.randint(0, args.num_inference_steps, (bsz,), device=latents.device)
+            # for i in range(bsz):
+            #     timesteps[i] = noise_scheduler.timesteps[timesteps[i]]
+            # scaled_timesteps = timesteps * task_transformer.config.timestep_scale
+            # timesteps = noise_scheduler.timesteps[idx]
+            # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps=sched_t)
+
+            encoder_hidden_states = text_encoder(batch['input_ids'].to(text_encoder.device), return_dict=False)[0].to(task_transformer.device)
+            encoder_attn_mask = batch['attention_mask'].to(task_transformer.device)
+
+            if noise_scheduler.config.prediction_type == "flow_prediction":
+                target = noise - latents # https://openreview.net/pdf?id=N8Oj1XhtYZ Sana uses RF velocity prediction
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
             # Predict noise residual and compute loss
-            model_pred = task_unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+            model_pred = task_transformer(
+                noisy_latents, 
+                timestep=scaled_timesteps, 
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attn_mask,
+                return_dict=False,
+            )[0]
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             loss.backward()
             all_losses.append(loss.item())
             
-            if train_set == True:
+            if train_set:
                 if args.max_grad_norm > 0:
-                    clip_grad_norm_(task_unet.parameters(), args.max_grad_norm)
+                    clip_grad_norm_(task_transformer.parameters(), args.max_grad_norm)
                 task_optimizer.step()
                 task_lr_scheduler.step()
                 task_optimizer.zero_grad()
-    if train_set == False:
+    if not train_set:
         print(f"timestep: {fixed_time_step}, loss: {np.mean(all_losses)}")
-    return task_unet,task_optimizer,task_lr_scheduler
+    return task_transformer,task_optimizer,task_lr_scheduler
 
 
 
-
-def train_step_deng(dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,train_set=False):
-    for step, batch in enumerate(dataloader):
-            latents = vae.encode(batch["pixel_values"].to(vae.device)).latent_dist.sample()
-            latents = latents * vae.config.scaling_factor
-
-            noise = torch.randn_like(latents)
-
-            bsz = latents.shape[0]
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
-            
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            encoder_hidden_states = text_encoder(batch["input_ids"].to(vae.device), return_dict=False)[0]
-
-            # if noise_scheduler.config.prediction_type == "epsilon":
-            #     target = noise
-            # elif noise_scheduler.config.prediction_type == "v_prediction":
-            #     target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            # else:
-            #     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-            # target 为0
-            target = torch.zeros_like(noisy_latents)
-
-            # Predict noise residual and compute loss
-            model_pred = task_unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-            loss.backward()
-            
-            if train_set == True:
-                if args.max_grad_norm > 0:
-                    clip_grad_norm_(task_unet.parameters(), args.max_grad_norm)
-                task_optimizer.step()
-                task_lr_scheduler.step()
-                task_optimizer.zero_grad()
-    return task_unet,task_optimizer,task_lr_scheduler
-
-from datasets import load_dataset,load_from_disk
 def data_loader(args,tokenizer,caption_column="text",image_column="image"):
     hrm_dataset = load_dataset("imagefolder", data_dir="./dataset/hrm")
     irt_dataset = load_dataset("imagefolder", data_dir="./dataset/irt")
@@ -686,10 +716,16 @@ def data_loader(args,tokenizer,caption_column="text",image_column="image"):
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
+            
+        tokenizer.padding_side = "right"
         inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+            captions, 
+            max_length=min(tokenizer.model_max_length, 300), 
+            padding="max_length", 
+            truncation=True, 
+            return_tensors="pt",
         )
-        return inputs.input_ids
+        return inputs['input_ids'], inputs['attention_mask']
 
     train_transforms = transforms.Compose(
         [
@@ -705,12 +741,15 @@ def data_loader(args,tokenizer,caption_column="text",image_column="image"):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        attention_mask = torch.stack([example["attention_mask"] for example in examples])
+        return {"pixel_values": pixel_values, "input_ids": input_ids, "attention_mask": attention_mask}
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
+        input_ids, attn_mask = tokenize_captions(examples)
+        examples["input_ids"] = input_ids
+        examples["attention_mask"] = attn_mask
         return examples
 
     # Set the training transforms
@@ -778,6 +817,7 @@ def data_loader(args,tokenizer,caption_column="text",image_column="image"):
 def main():
 
     args = parse_args()
+    assert not args.fix_timesteps
 
     if args.seed is not None:
         set_seed(args.seed)
@@ -807,10 +847,10 @@ def main():
         wandb.init(
             project=args.wandb_project, 
             name=args.exp_name, 
-            dir=args.logging_dir, 
+            # dir=args.logging_dir, 
             config=args,
         )
-        args = wandb.config
+        # args = wandb.config
 
     logger.info(args)
     
@@ -830,21 +870,16 @@ def main():
     devices = [torch.device(f"cuda:{idx}") for idx in args.devices]
 
     # Load pretrained models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",)
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer",)
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder",)
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision,)
-    ddim_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",)
-
-    unet_teacher = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant,
-    )
-    unet_student = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant,
-    )
+    pipeline = SanaPipeline.from_pretrained(args.pretrained_model_name_or_path)
+    noise_scheduler: DPMSolverMultistepScheduler = pipeline.scheduler
+    tokenizer: GemmaTokenizerFast = pipeline.tokenizer
+    vae: AutoencoderDC = pipeline.vae
+    text_encoder: Gemma2Model = pipeline.text_encoder
+    transformer_teacher: SanaTransformer2DModel = pipeline.transformer
+    transformer_student = deepcopy(transformer_teacher)
 
     # Freeze vae and text_encoder
-    unet_teacher.requires_grad_(False)
+    transformer_teacher.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
@@ -857,10 +892,10 @@ def main():
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size
         )
     
-    names, parameters = gather_parameters(args, unet_student)
+    names, parameters = gather_parameters(args, transformer_student)
     logger.info(f"Finetuning parameters: {names}")
     num_train_param = sum(p.numel() for p in parameters)
-    num_total_param = sum(p.numel() for p in unet_student.parameters())
+    num_total_param = sum(p.numel() for p in transformer_student.parameters())
     print(f"Finetuning parameters: {num_train_param} / {num_total_param} ({num_train_param / num_total_param:.2%})")
 
     # Create optimizer and scheduler
@@ -878,26 +913,33 @@ def main():
         num_training_steps=args.num_train_steps * args.gradient_accumulation_steps,
     )
 
-    # First device -- unet_student, generator
-    # Second device -- unet_teacher, vae, text_encoder
-    unet_student = unet_student.to(args.devices[0])
+    # First device -- transformer_student, generator
+    # Second device -- transformer_teacher, vae, text_encoder
+    transformer_student = transformer_student.to(devices[0])
     gen = torch.Generator(device=devices[0])
 
-    unet_teacher = unet_teacher.to(devices[1])
+    transformer_teacher = transformer_teacher.to(devices[1])
     text_encoder = text_encoder.to(devices[1])
-    vae = vae.to(args.devices[1])
+    vae = vae.to(devices[1])
     if args.seed is not None:
         gen.manual_seed(args.seed)
 
     if args.use_wandb:
-        wandb.watch(unet_student, log="all")
+        wandb.watch(transformer_student, log="all")
     
     if args.use_fp16:
+        raise NotImplementedError()
         # Mixed precision training
-        scaler = torch.cuda.amp.GradScaler()
+        # scaler = torch.cuda.amp.GradScaler()
+    else:
+        assert vae.dtype == torch.float32
+        assert transformer_student.dtype == torch.float32
+        assert transformer_teacher.dtype == torch.float32
+        assert text_encoder.dtype == torch.float32
 
     # Set the number of inference time steps
-    ddim_scheduler.set_timesteps(args.num_ddim_steps, devices[1])
+    # ddim_scheduler.set_timesteps(args.num_ddim_steps, devices[1])
+    noise_scheduler.set_timesteps(args.num_inference_steps, device=vae.device)
 
     # Validation at the beginning
     step = 0
@@ -907,7 +949,7 @@ def main():
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
-            unet=unet_teacher,
+            transformer=transformer_teacher,
             weight_dtype=vae.dtype,
             step=step,
             device=devices[1],
@@ -916,13 +958,13 @@ def main():
     hrm_train_dataloader,hrm_test_dataloader,irt_train_dataloader,irt_test_dataloader,tgt_train_dataloader,tgt_test_dataloader = data_loader(args,tokenizer)
     progress_bar = tqdm(range(1, args.num_train_steps+1), desc="Training")
 
-    for step in progress_bar:
+    for step in progress_bar: # Outer loop
 
         removing_concept = random.choice(args.removing_concepts)
         removing_prompt = removing_concept
         prompt = removing_prompt
 
-        unet_student.train()
+        transformer_student.train()
         sum_grads = [torch.zeros_like(p) for p in parameters]
 
         if args.use_fp16:
@@ -936,16 +978,15 @@ def main():
                 removing_prompt=removing_prompt,
                 generator=gen,
                 noise_scheduler=noise_scheduler,
-                ddim_scheduler=ddim_scheduler,
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
-                unet_teacher=unet_teacher,
-                unet_student=unet_student,
+                transformer_teacher=transformer_teacher,
+                transformer_student=transformer_student,
                 devices=devices,
             )
 
-            task_unet = deepcopy(unet_student)
-            names_copy, parameters_copy = gather_parameters(args, task_unet)
+            task_transformer = deepcopy(transformer_student)
+            names_copy, parameters_copy = gather_parameters(args, task_transformer)
             task_optimizer = optim.AdamW(
                 parameters_copy,
                 lr=args.learning_rate,
@@ -960,7 +1001,7 @@ def main():
                 num_training_steps=100,
             )
 
-            names_copy_full, parameters_copy_full = gather_parameters_full(args, task_unet)
+            names_copy_full, parameters_copy_full = gather_parameters_full(args, task_transformer)
 
             task_optimizer_full = optim.AdamW(
                 parameters_copy_full,
@@ -977,24 +1018,14 @@ def main():
             )
 
             if args.fix_timesteps:
-                for fixed_time_step in args.fixed_time_steps:
-                    task_unet,task_optimizer,task_lr_scheduler = train_step(irt_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,fixed_time_step=fixed_time_step)
-                    for i, param in enumerate(parameters_copy):
-                        sum_grads[i] += args.gamma1_1*param.grad
-                    task_optimizer.zero_grad()
-
-                for fixed_time_step in args.fixed_time_steps:
-                    task_unet,task_optimizer,task_lr_scheduler = train_step(tgt_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,fixed_time_step=fixed_time_step)
-                    for i, param in enumerate(parameters_copy):
-                        sum_grads[i] += args.gamma1_2*param.grad
-                    task_optimizer.zero_grad()
+                raise NotImplementedError()
             else:
-                task_unet,task_optimizer,task_lr_scheduler = train_step(irt_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                task_transformer,task_optimizer,task_lr_scheduler = train_step(irt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                 for i, param in enumerate(parameters_copy):
                     sum_grads[i] += args.gamma1_1*param.grad
                 task_optimizer.zero_grad()
 
-                task_unet,task_optimizer,task_lr_scheduler = train_step(tgt_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                task_transformer,task_optimizer,task_lr_scheduler = train_step(tgt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                 for i, param in enumerate(parameters_copy):
                     sum_grads[i] += args.gamma1_2*param.grad
                 task_optimizer.zero_grad()
@@ -1002,44 +1033,29 @@ def main():
 
             train_loss.backward()
 
-            for epoch in range(1):
+            for epoch in range(1): # FT "loop"
                 
-                task_unet,task_optimizer_full,task_lr_scheduler_full = train_step(hrm_train_dataloader,task_unet,task_optimizer_full,task_lr_scheduler_full,vae,text_encoder,noise_scheduler,args,train_set=True)
+                # Only this updates the task_transformer params
+                task_transformer,task_optimizer_full,task_lr_scheduler_full = train_step(hrm_train_dataloader,task_transformer,task_optimizer_full,task_lr_scheduler_full,vae,text_encoder,noise_scheduler,args,train_set=True)
                 task_optimizer_full.zero_grad()
 
                 if args.fix_timesteps:
-                    for fixed_time_step in args.fixed_time_steps:
-                        task_unet,task_optimizer,task_lr_scheduler = train_step(hrm_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,fixed_time_step=fixed_time_step)
-                        for i, param in enumerate(parameters_copy):
-                            sum_grads[i] -= args.gamma2_1*param.grad
-                        task_optimizer.zero_grad()
-
-                    for fixed_time_step in args.fixed_time_steps:
-                        task_unet,task_optimizer,task_lr_scheduler = train_step(tgt_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,fixed_time_step=fixed_time_step)
-                        for i, param in enumerate(parameters_copy):
-                            sum_grads[i] -= args.gamma2_2*param.grad
-                        task_optimizer.zero_grad()
-
-                    for fixed_time_step in args.fixed_time_steps:
-                        task_unet,task_optimizer,task_lr_scheduler = train_step(irt_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,fixed_time_step=fixed_time_step)
-                        for i, param in enumerate(parameters_copy):
-                            sum_grads[i] -= args.gamma2_3*param.grad
-                        task_optimizer.zero_grad()
+                    raise NotImplementedError()
 
                 else:
-                    task_unet,task_optimizer,task_lr_scheduler = train_step(hrm_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                    task_transformer,task_optimizer,task_lr_scheduler = train_step(hrm_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                     for i, param in enumerate(parameters_copy):
                         sum_grads[i] -= args.gamma2_1*param.grad
                     task_optimizer.zero_grad()
 
 
-                    task_unet,task_optimizer,task_lr_scheduler = train_step(tgt_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                    task_transformer,task_optimizer,task_lr_scheduler = train_step(tgt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                     for i, param in enumerate(parameters_copy):
                         sum_grads[i] -= args.gamma2_2*param.grad
                     task_optimizer.zero_grad()
 
 
-                    task_unet,task_optimizer,task_lr_scheduler = train_step(irt_test_dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                    task_transformer,task_optimizer,task_lr_scheduler = train_step(irt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                     for i, param in enumerate(parameters_copy):
                         sum_grads[i] -= args.gamma2_3*param.grad
                     task_optimizer.zero_grad()
@@ -1050,6 +1066,7 @@ def main():
                 param.grad += sum_grads[i]
 
 
+            # Update parameters (meta objective)
             if step % args.gradient_accumulation_steps == 0:
                 if args.max_grad_norm > 0:
                     clip_grad_norm_(parameters, args.max_grad_norm)
@@ -1073,7 +1090,7 @@ def main():
                 vae=vae,
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
-                unet=unet_student,
+                transformer=transformer_student,
                 weight_dtype=vae.dtype,
                 step=step,
                 device=devices[1],
@@ -1087,7 +1104,7 @@ def main():
                         args=args,
                         text_encoder=text_encoder,
                         vae=vae,
-                        unet=unet_student,
+                        transformer=transformer_student,
                         step=step,
                     )
 
@@ -1097,7 +1114,7 @@ def main():
             args=args,
             text_encoder=text_encoder,
             vae=vae,
-            unet=unet_student,
+            transformer=transformer_student,
         )
 
 

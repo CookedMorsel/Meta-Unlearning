@@ -583,7 +583,18 @@ def train_unlearn_step(
     
     return loss
 
-def train_step(dataloader,task_unet,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,fixed_time_step=1,train_set=False):
+def train_step(
+    dataloader,
+    task_unet: UNet2DConditionModel,
+    task_optimizer: optim.AdamW,
+    task_lr_scheduler: LambdaLR,
+    vae: AutoencoderKL,
+    text_encoder: CLIPTextModel,
+    noise_scheduler: DDPMScheduler,
+    args,
+    fixed_time_step=1,
+    train_set=False
+):
     all_losses = []
     for step, batch in enumerate(dataloader):
             latents = vae.encode(batch["pixel_values"].to(vae.device)).latent_dist.sample()
