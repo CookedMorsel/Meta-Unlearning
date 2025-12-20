@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--log_every", type=int, default=100,
         help="Log the training loss every `--log_every` steps.")
-    parser.add_argument("--eval_every", type=int, default=1000,
+    parser.add_argument("--eval_every", type=int, default=100,
         help="Evaluate the model every `--eval_every` steps.")
     parser.add_argument("--save_every", type=int, default=100,
         help="Save the model every `--save_every` steps.")
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         help="Evaluate the model after `--eval_after` steps.")
     parser.add_argument("--eval_at_first", action="store_true",
         help="Evaluate the model at the beginning.")
-    parser.add_argument("--max_checkpoints", type=int, default=5,
+    parser.add_argument("--max_checkpoints", type=int, default=20,
         help="The maximum number of checkpoints to keep.")
 
     parser.add_argument("--gamma1_1", type=float, default=1.0,)
@@ -182,13 +182,17 @@ def validate(
 ):
     logger.info("Running validation...")
 
+    # Save the original device of the transformer to restore it later
+    original_transformer_device = transformer.device
+
     pipeline = SanaPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         transformer=transformer,
-        torch_dtype=weight_dtype,
+        # torch_dtype=weight_dtype,
+        torch_dtype=torch.bfloat16, # We autocast to bf16 during forward passes to conserve VRAM
     )
     # pipeline = StableDiffusionPipeline.from_pretrained(
     #     args.pretrained_model_name_or_path,
@@ -262,17 +266,22 @@ def validate(
                 f.write(prompt + "\n")
 
     if args.use_wandb:
-        wandb.log({
-            "val/images": [
-                wandb.Image(image, caption=f"{i}: {prompt}")
-                for i, (prompt, image) in enumerate(zip(all_prompts, all_images))
-            ],
-            "step": step,
-        })
+        wandb.log(
+            {
+                "val/images": [
+                    wandb.Image(image, caption=f"{i}: {prompt}")
+                    for i, (prompt, image) in enumerate(zip(all_prompts, all_images))
+                ]
+            },
+            step=step,
+        )
     
     del pipeline
     with torch.cuda.device(device):
         torch.cuda.empty_cache()
+    
+    # Restore the transformer to its original device
+    transformer.to(original_transformer_device)
 
 
 def gather_parameters(args: argparse.Namespace, transformer: SanaTransformer2DModel) -> Tuple[List[str], List[torch.nn.Parameter]]:
@@ -332,6 +341,7 @@ def save_checkpoint(
 ):
     """Save a checkpoint. If step is None, save the entire pipeline.
     Otherwise, save only the unet model in the folder `step={step}`."""
+    print(f"Saving checkpoint for step {step}")
     max_checkpoints = args.max_checkpoints
     if step is not None:
         output_dir = os.path.join(args.output_dir, f"step={step:06d}")
@@ -353,6 +363,7 @@ def save_checkpoint(
             text_encoder=text_encoder,
             vae=vae,
             transformer=transformer,
+            torch_dtype=torch.bfloat16,
         )
         pipeline.save_pretrained(output_dir)
 
@@ -512,12 +523,13 @@ def sample_until(
 
         # predict the de-noise vector field
         # print(t)
-        noise_pred = transformer(
-            latent_model_input, 
-            timestep=timestep,
-            encoder_hidden_states=prompt_embeds,
-            encoder_attention_mask=prompt_attention_mask,
-        )[0]
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            noise_pred = transformer(
+                latent_model_input, 
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                encoder_attention_mask=prompt_attention_mask,
+            )[0]
         noise_pred = noise_pred.float()
 
         # perform guidance
@@ -607,8 +619,9 @@ def train_unlearn_step(
 
         # Stop-grad and send to the second device
         _latents = latents.to(devices[1])
-        e_0 = transformer_teacher(_latents, timestep=timestep.to(devices[1]), encoder_hidden_states=uncond_emb, encoder_attention_mask=uncond_attn_mask).sample
-        e_p = transformer_teacher(_latents, timestep=timestep.to(devices[1]), encoder_hidden_states=safety_emb, encoder_attention_mask=safety_attn_mask).sample
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            e_0 = transformer_teacher(_latents, timestep=timestep.to(devices[1]), encoder_hidden_states=uncond_emb, encoder_attention_mask=uncond_attn_mask).sample
+            e_p = transformer_teacher(_latents, timestep=timestep.to(devices[1]), encoder_hidden_states=safety_emb, encoder_attention_mask=safety_attn_mask).sample
 
         e_0 = e_0.detach().to(devices[0])
         e_p = e_p.detach().to(devices[0])
@@ -616,12 +629,13 @@ def train_unlearn_step(
         # args.concept_scale: s_s in the paper
         noise_target = e_0 - args.concept_scale * (e_p - e_0)
 
-    noise_pred = transformer_student(
-        latents, 
-        timestep=timestep.to(devices[0]), 
-        encoder_hidden_states=safety_emb.to(devices[0]), 
-        encoder_attention_mask=safety_attn_mask.to(devices[0])
-    ).sample
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        noise_pred = transformer_student(
+            latents, 
+            timestep=timestep.to(devices[0]), 
+            encoder_hidden_states=safety_emb.to(devices[0]), 
+            encoder_attention_mask=safety_attn_mask.to(devices[0])
+        ).sample
 
     loss = F.mse_loss(noise_pred, noise_target)
     
@@ -641,45 +655,46 @@ def train_step(
 ):
     all_losses = []
     for step, batch in enumerate(dataloader):
-            latents = vae.encode(batch["pixel_values"].to(task_transformer.device))['latent']
-            latents = latents * vae.config.scaling_factor
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                latents = vae.encode(batch["pixel_values"].to(vae.device))['latent']
+                latents = (latents * vae.config.scaling_factor).to(task_transformer.device, non_blocking=True)
 
-            bsz = latents.shape[0]
-            noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
+                noise = torch.randn_like(latents)
 
-            # Prepare timesteps
-            noise_scheduler.set_timesteps(args.num_inference_steps, device=task_transformer.device)
+                # Prepare timesteps
+                noise_scheduler.set_timesteps(args.num_inference_steps, device=task_transformer.device)
 
-            idx = torch.randint(0, noise_scheduler.timesteps.shape[0], (bsz,), device=latents.device)
-            sched_t = noise_scheduler.timesteps.to(latents.device)[idx]
-            scaled_timesteps = sched_t * task_transformer.config.timestep_scale
+                idx = torch.randint(0, noise_scheduler.timesteps.shape[0], (bsz,), device=latents.device)
+                sched_t = noise_scheduler.timesteps.to(latents.device)[idx]
+                scaled_timesteps = sched_t * task_transformer.config.timestep_scale
 
 
-            # timesteps = torch.randint(0, args.num_inference_steps, (bsz,), device=latents.device)
-            # for i in range(bsz):
-            #     timesteps[i] = noise_scheduler.timesteps[timesteps[i]]
-            # scaled_timesteps = timesteps * task_transformer.config.timestep_scale
-            # timesteps = noise_scheduler.timesteps[idx]
-            # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+                # timesteps = torch.randint(0, args.num_inference_steps, (bsz,), device=latents.device)
+                # for i in range(bsz):
+                #     timesteps[i] = noise_scheduler.timesteps[timesteps[i]]
+                # scaled_timesteps = timesteps * task_transformer.config.timestep_scale
+                # timesteps = noise_scheduler.timesteps[idx]
+                # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
 
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps=sched_t)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps=sched_t)
 
-            encoder_hidden_states = text_encoder(batch['input_ids'].to(text_encoder.device), return_dict=False)[0].to(task_transformer.device)
-            encoder_attn_mask = batch['attention_mask'].to(task_transformer.device)
+                encoder_hidden_states = text_encoder(batch['input_ids'].to(text_encoder.device), return_dict=False)[0].to(task_transformer.device)
+                encoder_attn_mask = batch['attention_mask'].to(task_transformer.device)
 
-            if noise_scheduler.config.prediction_type == "flow_prediction":
-                target = noise - latents # https://openreview.net/pdf?id=N8Oj1XhtYZ Sana uses RF velocity prediction
-            else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                if noise_scheduler.config.prediction_type == "flow_prediction":
+                    target = noise - latents # https://openreview.net/pdf?id=N8Oj1XhtYZ Sana uses RF velocity prediction
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-            # Predict noise residual and compute loss
-            model_pred = task_transformer(
-                noisy_latents, 
-                timestep=scaled_timesteps, 
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attn_mask,
-                return_dict=False,
-            )[0]
+                # Predict noise residual and compute loss
+                model_pred = task_transformer(
+                    noisy_latents, 
+                    timestep=scaled_timesteps, 
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attn_mask,
+                    return_dict=False,
+                )[0]
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             loss.backward()
@@ -693,7 +708,7 @@ def train_step(
                 task_optimizer.zero_grad()
     if not train_set:
         print(f"timestep: {fixed_time_step}, loss: {np.mean(all_losses)}")
-    return task_transformer,task_optimizer,task_lr_scheduler
+    return task_transformer,task_optimizer,task_lr_scheduler,float(np.mean(all_losses))
 
 
 
@@ -925,17 +940,17 @@ def main():
         gen.manual_seed(args.seed)
 
     if args.use_wandb:
-        wandb.watch(transformer_student, log="all")
+        wandb.watch(transformer_student, log="all", log_freq=args.eval_every)
     
-    if args.use_fp16:
-        raise NotImplementedError()
-        # Mixed precision training
-        # scaler = torch.cuda.amp.GradScaler()
-    else:
-        assert vae.dtype == torch.float32
-        assert transformer_student.dtype == torch.float32
-        assert transformer_teacher.dtype == torch.float32
-        assert text_encoder.dtype == torch.float32
+    # if args.use_fp16:
+    #     raise NotImplementedError()
+    #     # Mixed precision training
+    #     # scaler = torch.cuda.amp.GradScaler()
+    # else:
+    #     assert vae.dtype == torch.float32
+    #     assert transformer_student.dtype == torch.float32
+    #     assert transformer_teacher.dtype == torch.float32
+    #     assert text_encoder.dtype == torch.float32
 
     # Set the number of inference time steps
     # ddim_scheduler.set_timesteps(args.num_ddim_steps, devices[1])
@@ -959,7 +974,7 @@ def main():
     progress_bar = tqdm(range(1, args.num_train_steps+1), desc="Training")
 
     for step in progress_bar: # Outer loop
-
+        print(f"Starting step {step}")
         removing_concept = random.choice(args.removing_concepts)
         removing_prompt = removing_concept
         prompt = removing_prompt
@@ -987,6 +1002,8 @@ def main():
 
             task_transformer = deepcopy(transformer_student)
             names_copy, parameters_copy = gather_parameters(args, task_transformer)
+            # In the original implementation `task_optimizer` is never used.. So 2 copies of the optimizer are wasted vram
+            # Additionally, since we always do only 1 step in the inner loop, there's no sense in keeping adam states. We can simply use SGD
             task_optimizer = optim.AdamW(
                 parameters_copy,
                 lr=args.learning_rate,
@@ -994,38 +1011,50 @@ def main():
                 eps=args.adam_epsilon,
                 weight_decay=args.weight_decay,
             )
+            # task_optimizer = optim.SGD(
+            #     parameters_copy,
+            #     lr=args.learning_rate,
+            #     weight_decay=args.weight_decay,
+            # )
             task_lr_scheduler: LambdaLR = get_scheduler(
-                name=args.lr_scheduler,
+                # Has no effect because it's re-initialized every step
+                name="constant",#args.lr_scheduler, 
                 optimizer=task_optimizer,
                 num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
                 num_training_steps=100,
             )
 
-            names_copy_full, parameters_copy_full = gather_parameters_full(args, task_transformer)
+            # names_copy_full, parameters_copy_full = gather_parameters_full(args, task_transformer)
 
-            task_optimizer_full = optim.AdamW(
-                parameters_copy_full,
-                lr=args.learning_rate,
-                betas=(args.adam_beta1, args.adam_beta2),
-                eps=args.adam_epsilon,
-                weight_decay=args.weight_decay,
-            )
-            task_lr_scheduler_full: LambdaLR = get_scheduler(
-                name=args.lr_scheduler,
-                optimizer=task_optimizer_full,
-                num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-                num_training_steps=100,
-            )
+            # task_optimizer_full = optim.AdamW(
+            #     parameters_copy_full,
+            #     lr=args.learning_rate,
+            #     betas=(args.adam_beta1, args.adam_beta2),
+            #     eps=args.adam_epsilon,
+            #     weight_decay=args.weight_decay,
+            # )
+            # task_lr_scheduler_full: LambdaLR = get_scheduler(
+            #     name=args.lr_scheduler,
+            #     optimizer=task_optimizer_full,
+            #     num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            #     num_training_steps=100,
+            # )
 
             if args.fix_timesteps:
                 raise NotImplementedError()
             else:
-                task_transformer,task_optimizer,task_lr_scheduler = train_step(irt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                task_transformer,task_optimizer,task_lr_scheduler,student_irt_loss = train_step(irt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                 for i, param in enumerate(parameters_copy):
                     sum_grads[i] += args.gamma1_1*param.grad
                 task_optimizer.zero_grad()
 
-                task_transformer,task_optimizer,task_lr_scheduler = train_step(tgt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                # print(f"vae: {vae.device}")
+                # print(f"text_encoder: {text_encoder.device}")
+                # print(f"task_transformer: {task_transformer.device}")
+                # print(f"transformer_student: {transformer_student.device}")
+                # print(f"transformer_teacher: {transformer_teacher.device}")
+
+                task_transformer,task_optimizer,task_lr_scheduler,student_tgt_loss = train_step(tgt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                 for i, param in enumerate(parameters_copy):
                     sum_grads[i] += args.gamma1_2*param.grad
                 task_optimizer.zero_grad()
@@ -1035,27 +1064,28 @@ def main():
 
             for epoch in range(1): # FT "loop"
                 
-                # Only this updates the task_transformer params
-                task_transformer,task_optimizer_full,task_lr_scheduler_full = train_step(hrm_train_dataloader,task_transformer,task_optimizer_full,task_lr_scheduler_full,vae,text_encoder,noise_scheduler,args,train_set=True)
-                task_optimizer_full.zero_grad()
+                # Only this updates the task_transformer params (because of train_set=True)
+                # task_transformer,task_optimizer_full,task_lr_scheduler_full = train_step(hrm_train_dataloader,task_transformer,task_optimizer_full,task_lr_scheduler_full,vae,text_encoder,noise_scheduler,args,train_set=True)
+                task_transformer,task_optimizer,task_lr_scheduler,target_ft_loss = train_step(hrm_train_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args,train_set=True)
+                task_optimizer.zero_grad()
 
                 if args.fix_timesteps:
                     raise NotImplementedError()
 
                 else:
-                    task_transformer,task_optimizer,task_lr_scheduler = train_step(hrm_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                    task_transformer,task_optimizer,task_lr_scheduler,target_hrm_loss = train_step(hrm_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                     for i, param in enumerate(parameters_copy):
                         sum_grads[i] -= args.gamma2_1*param.grad
                     task_optimizer.zero_grad()
 
 
-                    task_transformer,task_optimizer,task_lr_scheduler = train_step(tgt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                    task_transformer,task_optimizer,task_lr_scheduler,target_tgt_loss = train_step(tgt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                     for i, param in enumerate(parameters_copy):
                         sum_grads[i] -= args.gamma2_2*param.grad
                     task_optimizer.zero_grad()
 
 
-                    task_transformer,task_optimizer,task_lr_scheduler = train_step(irt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
+                    task_transformer,task_optimizer,task_lr_scheduler,target_irt_loss = train_step(irt_test_dataloader,task_transformer,task_optimizer,task_lr_scheduler,vae,text_encoder,noise_scheduler,args)
                     for i, param in enumerate(parameters_copy):
                         sum_grads[i] -= args.gamma2_3*param.grad
                     task_optimizer.zero_grad()
@@ -1063,7 +1093,7 @@ def main():
 
             # Apply accumulated gradients to the main model
             for i, param in enumerate(parameters):
-                param.grad += sum_grads[i]
+                param.grad += sum_grads[i].to(param.device)
 
 
             # Update parameters (meta objective)
@@ -1078,13 +1108,21 @@ def main():
 
         progress_bar.set_description(f"Training: {train_loss.item():.4f} on c_p: {prompt} - c_s: {removing_concept}")
         if args.use_wandb:
-            wandb.log({"train/loss": train_loss.item(), "step": step, "train/lr": lr_scheduler.get_last_lr()[0]})
+            wandb.log({
+                "train/esd_loss": train_loss.item(), "step": step, "train/lr": lr_scheduler.get_last_lr()[0],
+                "train/student_irt_loss": student_irt_loss,
+                "train/student_tgt_loss": student_tgt_loss,
+                "train/target_ft_loss": target_ft_loss,
+                "train/target_hrm_loss": target_hrm_loss,
+                "train/target_tgt_loss": target_tgt_loss,
+                "train/target_irt_loss": target_irt_loss,
+            }, step=step)
 
         if (step % args.log_every == 0) and (args.logging_dir is not None):
             logger.info(f"Step: {step} | Loss: {train_loss.item():.4f} | LR: {lr_scheduler.get_last_lr()[0]:.4e}")
 
         # Validation
-        if (step % args.eval_every == 0) and (step >= args.eval_after) and (len(args.validation_prompts) > 0):
+        if (step == 1 or (step % args.eval_every == 0)) and (step >= args.eval_after) and (len(args.validation_prompts) > 0):
             validate(
                 args=args,
                 vae=vae,
@@ -1097,16 +1135,16 @@ def main():
                 prefix="teacher",
             )
 
-            # Save checkpoint
-            if step % args.save_every == 0:
-                if args.output_dir is not None:
-                    save_checkpoint(
-                        args=args,
-                        text_encoder=text_encoder,
-                        vae=vae,
-                        transformer=transformer_student,
-                        step=step,
-                    )
+        # Save checkpoint
+        if step % args.save_every == 0:
+            if args.output_dir is not None:
+                save_checkpoint(
+                    args=args,
+                    text_encoder=text_encoder,
+                    vae=vae,
+                    transformer=transformer_student,
+                    step=step,
+                )
 
     # Save final checkpoint
     if args.output_dir is not None:

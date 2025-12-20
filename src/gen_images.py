@@ -172,7 +172,7 @@ text_dict = {"woman":["woman"],
              "style":["Thomas Kinkade"],
              "paint":["a painting"],
              "ft_style":["a big garden by Thomas Kinkade", "a village in the forest by Thomas Kinkade", "a peaceful park by Thomas Kinkade", "a beautiful house by Thomas Kinkade", "a colorful tree by Thomas Kinkade"],
-             "retain": list(text_all_p),
+             "text_all_p": list(text_all_p),
              # HRM = Harmful / Forget set (e.g. Nudity)
              # TGT = Target set (human like images)
              # IRT = Indirectly Related Triggers (random objects)
@@ -184,6 +184,7 @@ text_dict = {"woman":["woman"],
 
 # for type_name in ["style","paint"]: #["ft_style"]: #["hrm","rel"]:
 for type_name in ['hrm', 'tgt', 'irt']:#["hrm", "retain"]:
+    print(f"Generating for {type_name}")
     
     output_dir = root_dir+type_name
     if not os.path.exists(output_dir):
@@ -205,13 +206,16 @@ for type_name in ['hrm', 'tgt', 'irt']:#["hrm", "retain"]:
 
     text_all = text_dict[type_name]
 
+    epoch_size = 100
+    num_images = epoch_size // len(text_all)
+    print(f"For {type_name}, will generate {num_images} per text prompt (n_prompts = {len(text_all)})")
+    assert num_images > 0
+
     train_data = []
     test_data = []
     for text in text_all:
-        train_data.extend(generate_images(pipeline, text, num_images=30))
-
-        if type_name != 'retain':
-            test_data.extend(generate_images(pipeline, text, num_images=30))
+        train_data.extend(generate_images(pipeline, text, num_images=num_images))
+        test_data.extend(generate_images(pipeline, text, num_images=num_images))
 
 
     save_images(train_data, train_image_dir)
